@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Smart Cane Companion</string>
+    <string name="connect">Connect to Cane</string>
+    <string name="status_disconnected">Not connected</string>
+</resources>
