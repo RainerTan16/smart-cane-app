@@ -24,26 +24,20 @@ import java.util.UUID
 import java.util.concurrent.Executors
 
 /**
- * Smart Cane Companion — proof-of-concept.
+ * Smart Cane Companion.
  *
  * Flow: pair this phone to "SmartCane" in Android's Bluetooth
- * settings first, then open this app and hit Connect. Every alert
- * byte the ESP32 forwards gets mapped to a preloaded sound and
- * played instantly — audio comes out through whatever Bluetooth
- * headset (AirPods) is currently the phone's active audio output.
- * No AirPods-specific code needed; that routing is automatic on
- * Android.
+ * settings first, then open this app and tap Connect. Every track
+ * number the ESP32 forwards gets played instantly from a preloaded
+ * sound. Audio comes out through whatever Bluetooth headset (AirPods)
+ * is the phone's active audio output. No AirPods-specific code is
+ * needed; Android routes it automatically.
  *
- * This is a starting point, not a finished app. Known gaps, worth
- * fixing before the actual defense demo:
- *  - No auto-reconnect if the connection drops mid-walk
- *  - No foreground service, so Android may kill the Bluetooth
- *    listener if the app is backgrounded for a while
- *  - No handling for unknown/unmapped track codes beyond ignoring them
+ * Known gaps: no auto-reconnect, no foreground service.
  */
 class MainActivity : AppCompatActivity() {
 
-    // Standard Serial Port Profile UUID — matches ESP32's BluetoothSerial
+    // Standard Serial Port Profile UUID, matches the ESP32's BluetoothSerial
     private val sppUuid: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
@@ -60,26 +54,13 @@ class MainActivity : AppCompatActivity() {
 
     private val pairedDevices = mutableListOf<BluetoothDevice>()
 
-    // SoundPool preloads every clip at launch so playback on an alert
-    // is near-instant (a few ms) instead of MediaPlayer's ~100-500ms
-    // per-play decode/prepare cost. That gap matters for a device
-    // whose whole purpose is an immediate warning.
+    // SoundPool preloads every clip at launch so playback is near-instant.
     private lateinit var soundPool: SoundPool
     private val soundIds = mutableMapOf<Int, Int>() // track code -> loaded sound id
 
-    /**
-     * Your real track range is bigger than a fixed map is worth
-     * maintaining by hand: 1-21 (obstacle zone/distance combos),
-     * 29-30 (stairs), 40-42 (SOS/system) — plus a "hole detected"
-     * code and incline codes that aren't nailed down yet.
-     *
-     * Instead of a hardcoded list, this scans res/raw at startup
-     * for any file matching "alert_XXXX" and preloads whatever it
-     * finds. Drop in res/raw/alert_0015.mp3 for track 15 and it
-     * just works — no code change needed here when new tracks (like
-     * the hole/incline ones) get added later.
-     */
-    private val maxTrackCodeToScan = 99 // covers your current 1-42 range with headroom
+    // The app scans res/raw for files named alert_0001 ... alert_0099 and
+    // preloads whatever exists. Add a file, it just works. No code change.
+    private val maxTrackCodeToScan = 99
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -90,10 +71,18 @@ class MainActivity : AppCompatActivity() {
         connectButton = findViewById(R.id.connectButton)
 
         setupSoundPool()
-        requestBtPermissionsIfNeeded()
-        loadPairedDevices()
+
+        if (!hasBtPermission()) requestBtPermission()
 
         connectButton.setOnClickListener {
+            if (!hasBtPermission()) {
+                requestBtPermission()
+                return@setOnClickListener
+            }
+            if (bluetoothAdapter?.isEnabled != true) {
+                statusText.text = "Turn on Bluetooth first"
+                return@setOnClickListener
+            }
             val device = pairedDevices.getOrNull(deviceSpinner.selectedItemPosition)
             if (device == null) {
                 Toast.makeText(
@@ -107,19 +96,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        // Refresh the list whenever the screen comes back, so a device that
+        // was just paired in Bluetooth settings shows up without restarting.
+        if (hasBtPermission()) loadPairedDevices()
+    }
+
     private fun setupSoundPool() {
         val attrs = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+            .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
             .build()
 
         soundPool = SoundPool.Builder()
-            .setMaxStreams(2) // a couple of overlapping alerts is fine; more gets confusing to hear anyway
+            .setMaxStreams(2)
             .setAudioAttributes(attrs)
             .build()
 
-        // Preload every clip that exists, while the app is idle, so
-        // there's no decode/prepare delay at the moment an alert fires.
         for (trackCode in 1..maxTrackCodeToScan) {
             val resName = "alert_%04d".format(trackCode)
             val resId = resources.getIdentifier(resName, "raw", packageName)
@@ -129,27 +123,54 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun requestBtPermissionsIfNeeded() {
+    // On Android 12+ the app must be granted BLUETOOTH_CONNECT before it may
+    // even read the list of paired devices. Without this check the app
+    // crashes on first launch.
+    private fun hasBtPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
+        return ActivityCompat.checkSelfPermission(
+            this, Manifest.permission.BLUETOOTH_CONNECT
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun requestBtPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val needed = listOf(
-                Manifest.permission.BLUETOOTH_CONNECT,
-                Manifest.permission.BLUETOOTH_SCAN
-            ).filter {
-                ActivityCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-            }
-            if (needed.isNotEmpty()) {
-                ActivityCompat.requestPermissions(this, needed.toTypedArray(), 1)
+            ActivityCompat.requestPermissions(
+                this, arrayOf(Manifest.permission.BLUETOOTH_CONNECT), 1
+            )
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1) {
+            if (hasBtPermission()) {
+                loadPairedDevices()
+            } else {
+                statusText.text =
+                    "Bluetooth permission denied. Allow it in Settings > Apps > Smart Cane Companion > Permissions"
             }
         }
     }
 
     private fun loadPairedDevices() {
-        val bonded = bluetoothAdapter?.bondedDevices ?: emptySet()
-        pairedDevices.clear()
-        pairedDevices.addAll(bonded)
-        val names = bonded.map { it.name ?: it.address }
-        deviceSpinner.adapter =
-            ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, names)
+        try {
+            val bonded = bluetoothAdapter?.bondedDevices ?: emptySet()
+            pairedDevices.clear()
+            pairedDevices.addAll(bonded)
+            val names = pairedDevices.map { it.name ?: it.address }
+            deviceSpinner.adapter =
+                ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, names)
+            // Pre-select the cane if it is already paired
+            val cane = pairedDevices.indexOfFirst { it.name == "SmartCane" }
+            if (cane >= 0) deviceSpinner.setSelection(cane)
+        } catch (e: SecurityException) {
+            statusText.text = "Bluetooth permission needed"
+        }
     }
 
     private fun connectTo(device: BluetoothDevice) {
@@ -162,7 +183,7 @@ class MainActivity : AppCompatActivity() {
                 socket = sock
                 mainHandler.post { statusText.text = "Connected to ${device.name}" }
                 listenForAlerts(sock.inputStream)
-            } catch (e: IOException) {
+            } catch (e: Exception) {
                 mainHandler.post { statusText.text = "Connection failed: ${e.message}" }
             }
         }
@@ -170,21 +191,21 @@ class MainActivity : AppCompatActivity() {
 
     private fun listenForAlerts(input: InputStream) {
         val reader = input.bufferedReader()
-        while (true) {
-            try {
+        try {
+            while (true) {
                 val line = reader.readLine() ?: break
-                // Ignore anything non-numeric (e.g. stray text) rather than crash
+                // Ignore anything that is not a number (e.g. the "SOS_ALERT" text)
                 val trackCode = line.trim().toIntOrNull() ?: continue
                 playAlert(trackCode)
-            } catch (e: IOException) {
-                mainHandler.post { statusText.text = "Disconnected: ${e.message}" }
-                break
             }
+        } catch (e: IOException) {
+            // fall through to the message below
         }
+        mainHandler.post { statusText.text = "Disconnected. Tap Connect to reconnect" }
     }
 
     private fun playAlert(trackCode: Int) {
-        val soundId = soundIds[trackCode] ?: return // unknown code — ignore
+        val soundId = soundIds[trackCode] ?: return // no audio file for this code
         mainHandler.post {
             soundPool.play(soundId, 1f, 1f, 1, 0, 1f)
         }
@@ -193,11 +214,9 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         ioExecutor.shutdownNow()
-        socket?.let {
-            try {
-                it.close()
-            } catch (_: IOException) {
-            }
+        try {
+            socket?.close()
+        } catch (e: IOException) {
         }
         soundPool.release()
     }
